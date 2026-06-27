@@ -27,6 +27,8 @@ export class GlimmerAI {
 
   /** Timer for strategy switching */
   private strategyTimer: number = 0;
+  /** Accumulator for reaction delay — only decide every GLIMMER_REACTION_MS */
+  private reactionAccum: number = 0;
 
   /** Last chosen action */
   lastAction: HeroAction = HeroAction.Wait;
@@ -50,8 +52,20 @@ export class GlimmerAI {
 
   /**
    * Choose the hero's next action given the current arena state.
+   * @param dt — frame delta in seconds (from ArenaScene)
    */
-  decide(state: ArenaState): HeroAction {
+  decide(state: ArenaState, dt: number): HeroAction {
+    // Accumulate strategy timer every frame (before reaction-delay gate)
+    this.strategyTimer += dt;
+
+    // Reaction delay: only re-evaluate every GLIMMER_REACTION_MS
+    this.reactionAccum += dt * 1000;
+    if (this.reactionAccum < GAME_CONFIG.GLIMMER_REACTION_MS) {
+      state.heroAction = HeroAction.Wait;
+      return HeroAction.Wait;
+    }
+    this.reactionAccum = 0;
+
     const currentBelief = this.zoneBeliefs[ZONE_INDEX[state.heroZone as string]!];
     // 1. Update beliefs based on current zone (inlined — hot path)
     if (currentBelief) {

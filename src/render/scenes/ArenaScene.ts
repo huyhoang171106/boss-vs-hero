@@ -91,7 +91,7 @@ export class ArenaScene extends Phaser.Scene {
 
     // 1. AI decides action
     if (this.simState.heroAlive && !this.simState.heroWon) {
-      this.glimmer.decide(this.simState);
+      this.glimmer.decide(this.simState, delta / 1000);
       this.moveHero();
     }
 

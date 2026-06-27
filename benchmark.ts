@@ -19,7 +19,7 @@ function reset(state: ArenaState): void {
 
 function runTicks(state: ArenaState, engine: RuleEngine, ai: GlimmerAI, count: number): void {
   for (let i = 0; i < count; i++) {
-    ai.decide(state);
+    ai.decide(state, DT);
     const events = engine.tick(state, DT);
     ai.recordOutcome(state, events.heroDamaged, events.heroDodged);
     if (state.attemptOver) reset(state);
