@@ -1,460 +1,640 @@
+/**
+ * DEADLOCK — Glimmer AI
+ * 
+ * The hero that learns, adapts, and creates mind games.
+ * 
+ * Core behaviors:
+ * 1. Remembers damage per zone and timing
+ * 2. Fakes movements to bait player activation
+ * 3. Adapts strategy based on memory
+ * 4. Shows visible intent (next move)
+ * 5. Creates psychological battle with player
+ */
+
 import {
-  ZoneId, PLAYABLE_ZONES, ZONE_CONNECTIONS,
-  GAME_CONFIG, ZONE_INDEX, RuleType, HeroAction,
+  ZoneId, ALL_ZONES, TRAP_ZONES, ZONE_INDEX,
+  TrapType, HeroAction, HeroAbility,
+  AIStrategy, GAME_CONFIG,
 } from '../game/simulation/Types';
-import type { MemoryEntry } from '../game/simulation/Types';
-import { ArenaState } from '../game/simulation/ArenaState';
+import type { MemoryEntry, AIJournalEntry } from '../game/simulation/Types';
+import type { ArenaState } from '../game/simulation/ArenaState';
+
 /**
  * Glimmer's brain.
- *
- * Uses a Strategy Tree: remembers outcomes of past actions,
- * explores new approaches when old ones fail, exploits what works.
- *
+ * 
+ * Uses memory-based strategy selection with visible intent.
  * Pure logic — no rendering.
  */
 export class GlimmerAI {
-  /** Memory of past outcomes keyed by zone+rule combo */
+  // ═══════════════════════════════════════════════════════
+  // MEMORY
+  // ═══════════════════════════════════════════════════════
+  
+  /** Memory of past outcomes keyed by zone+trapType */
   private memory: Map<string, MemoryEntry[]> = new Map();
-
-  /** Current exploration level (0 = exploit, 1 = explore) */
-  private explorationRate: number = 1.0;
-
-  /** How many times each strategy has been tried */
-  private strategyTries: Map<string, number> = new Map();
-
-  /** Current strategy the hero is executing */
-  private currentStrategy: string = 'explore';
-
-  /** Timer for strategy switching */
+  
+  /** Zone safety beliefs (indexed by ZONE_INDEX) */
+  private zoneBeliefs: { safe: boolean; dangerLevel: number; lastChecked: number }[] = [];
+  
+  /** Timing memory: when player typically activates */
+  private timingMemory: Map<number, number> = new Map(); // timestamp -> count
+  
+  /** Strategy success tracking */
+  private strategySuccess: Map<AIStrategy, number> = new Map();
+  
+  /** Strategy failure tracking */
+  private strategyFailure: Map<AIStrategy, number> = new Map();
+  
+  // ═══════════════════════════════════════════════════════
+  // STATE
+  // ═══════════════════════════════════════════════════════
+  
+  /** Current strategy being used */
+  currentStrategy: AIStrategy = AIStrategy.Wait;
+  
+  /** Strategy timer (switch strategy periodically) */
   private strategyTimer: number = 0;
-  /** Accumulator for reaction delay — only decide every GLIMMER_REACTION_MS */
+  
+  /** Reaction delay accumulator */
   private reactionAccum: number = 0;
-
+  
   /** Last chosen action */
   lastAction: HeroAction = HeroAction.Wait;
-
-  /** Personality: how often the hero tries completely random things */
-  private curiosity: number = 0.3;
-
-  /** Track if hero is "confused" (keeps failing same way) */
-  private failureStreak: number = 0;
-
-  /** Zone safety memory — what the hero believes about each zone (array indexed by ZONE_INDEX) */
-  private zoneBeliefs: { safe: boolean; lastChecked: number; hazardTiming: number }[] = [];
-
+  
+  /** Next intended zone (for visible intent) */
+  intentZone: ZoneId | null = null;
+  
+  /** Is the AI currently faking? */
+  isFaking: boolean = false;
+  
+  /** Fake target (where AI pretends to go) */
+  fakeTarget: ZoneId | null = null;
+  
+  /** Real target (where AI actually wants to go) */
+  realTarget: ZoneId | null = null;
+  
+  /** AI journal for display */
+  private aiJournal: AIJournalEntry[] = [];
+  
+  /** Current attempt number */
+  private attemptNumber: number = 1;
+  
+  // ═══════════════════════════════════════════════════════
+  // CONSTRUCTOR
+  // ═══════════════════════════════════════════════════════
+  
   constructor() {
-    for (let i = 0; i < PLAYABLE_ZONES.length; i++) {
-      const z = PLAYABLE_ZONES[i];
-      const idx = ZONE_INDEX[z as string]!;
-      this.zoneBeliefs[idx] = { safe: true, lastChecked: 0, hazardTiming: 0 };
+    // Initialize zone beliefs
+    for (let i = 0; i < ALL_ZONES.length; i++) {
+      this.zoneBeliefs[i] = { safe: true, dangerLevel: 0, lastChecked: 0 };
+    }
+    
+    // Initialize strategy tracking
+    for (const strategy of Object.values(AIStrategy)) {
+      this.strategySuccess.set(strategy as AIStrategy, 0);
+      this.strategyFailure.set(strategy as AIStrategy, 0);
     }
   }
-
+  
+  // ═══════════════════════════════════════════════════════
+  // MAIN DECISION
+  // ═══════════════════════════════════════════════════════
+  
   /**
    * Choose the hero's next action given the current arena state.
-   * @param dt — frame delta in seconds (from ArenaScene)
+   * @param state - Current game state
+   * @param dt - Frame delta in seconds
+   * @returns Hero action to execute
    */
   decide(state: ArenaState, dt: number): HeroAction {
-    // Accumulate strategy timer every frame (before reaction-delay gate)
+    // Accumulate strategy timer
     this.strategyTimer += dt;
-
-    // Reaction delay: only re-evaluate every GLIMMER_REACTION_MS
+    
+    // Reaction delay: only re-evaluate every AI_REACTION_MS
+    let effectiveReactionMs = state.aiReactionMs;
     this.reactionAccum += dt * 1000;
-    if (this.reactionAccum < GAME_CONFIG.GLIMMER_REACTION_MS) {
-      state.heroAction = HeroAction.Wait;
-      return HeroAction.Wait;
+    if (this.reactionAccum < effectiveReactionMs) {
+      return this.lastAction;
     }
     this.reactionAccum = 0;
-
-    const currentBelief = this.zoneBeliefs[ZONE_INDEX[state.heroZone as string]!];
-    // 1. Update beliefs based on current zone (inlined — hot path)
-    if (currentBelief) {
-      const rules = state.getRulesInZone(state.heroZone);
-      let hasActiveHazard = false;
-      for (let i = 0; i < rules.length; i++) {
-        const r = rules[i];
-        if (r.isErupting || r.wallUp || r.projectile) {
-          hasActiveHazard = true;
-          break;
-        }
-      }
-      if (!hasActiveHazard) {
-        currentBelief.safe = true;
-        currentBelief.lastChecked = state.elapsedTime;
-      }
-    }
-
-    // 2. Should we switch strategy?
+    
+    // Update beliefs based on current zone
+    this.updateBeliefs(state);
+    
+    // Should we switch strategy?
     this.evaluateStrategy(state);
-
-    // 3. Choose action based on current strategy
+    
+    // Execute current strategy
     const action = this.executeStrategy(state);
-
+    
     this.lastAction = action;
     state.heroAction = action;
+    
+    // Compute intent for visible display
+    this.computeIntent(state);
+    
     return action;
   }
-
-  /** Record what happened to the hero this frame */
-  recordOutcome(state: ArenaState, damaged: boolean, dodged: boolean): void {
-    const key = this.memoryKey(state.heroZone, null);
-    const outcome: MemoryEntry = {
-      zone: state.heroZone,
-      ruleType: null,
-      outcome: damaged ? 'damage' : dodged ? 'dodge' : 'safe',
-      timestamp: state.elapsedTime,
-      attempt: state.attemptNumber,
-    };
-    let arr = this.memory.get(key);
-    if (!arr) { arr = []; this.memory.set(key, arr); }
-    arr.push(outcome);
-
-    // Note: per-rule-type memory is NOT stored here — it's only consumed by the review
-    // panel, and the AI strategies only read zone-level memory (memoryKey with null ruleType).
-    // Removing per-rule writes saves 3 allocations + 3 Map ops per tick.
-
-    if (damaged) {
-      this.failureStreak++;
-      const belief = this.zoneBeliefs[ZONE_INDEX[state.heroZone as string]!];
-      if (belief) {
-        belief.safe = false;
-        belief.lastChecked = state.elapsedTime;
-      }
+  
+  // ═══════════════════════════════════════════════════════
+  // BELIEF UPDATES
+  // ═══════════════════════════════════════════════════════
+  
+  /** Update zone beliefs based on current state */
+  private updateBeliefs(state: ArenaState): void {
+    const currentZone = state.hero.zone;
+    const currentIdx = ZONE_INDEX[currentZone] ?? 0;
+    const belief = this.zoneBeliefs[currentIdx];
+    
+    if (!belief) return;
+    
+    // Check if there's an active trap in current zone
+    if (state.trap && state.hero.zone === state.trap.zone && state.trap.fired) {
+      belief.safe = false;
+      belief.dangerLevel = Math.min(1, belief.dangerLevel + 0.1);
     } else {
-      this.failureStreak = Math.max(0, this.failureStreak - 1);
+      belief.safe = true;
+      belief.dangerLevel = Math.max(0, belief.dangerLevel - 0.05);
     }
+    
+    belief.lastChecked = state.elapsedTime;
   }
-
-  /** Record final outcome of an attempt */
-  recordAttemptOutcome(state: ArenaState): void {
-    if (state.heroWon) {
-      // This strategy worked — boost its score
-      const tries = this.strategyTries.get(this.currentStrategy) || 0;
-      this.strategyTries.set(this.currentStrategy, tries + 10);
-    } else if (!state.heroAlive) {
-      // This strategy failed — reduce exploration (hero is more cautious now)
-      this.explorationRate = Math.max(0.2, this.explorationRate - 0.1);
-    }
-
-    // Learning: after each death, hero remembers more clearly
-    this.consolidateMemory();
-  }
-
-  /** Increase curiosity after new rule cards are encountered */
-  onNewRules(state: ArenaState): void {
-    const occupied = state.getOccupiedZones();
-    for (const z of occupied) {
-      const belief = this.zoneBeliefs[ZONE_INDEX[z as string]!];
-      if (belief) {
-        belief.safe = true; // Reset belief — new rules change everything
-        belief.lastChecked = 0;
-      }
-    }
-    // Boost curiosity — new rules might mean new opportunities
-    this.curiosity = Math.min(0.5, this.curiosity + 0.15);
-  }
-
-  /** Reset for a new attempt (keep memory!) */
-  onNewAttempt(): void {
-    this.strategyTimer = 0;
-    this.failureStreak = 0;
-    // Slightly increase exploration at start of new attempt
-    if (this.explorationRate < 0.8) {
-      this.explorationRate += 0.05;
-    }
-  }
-
-  /** Get the hero's "thought process" for review panel */
-  getThoughts(state?: ArenaState): string[] {
-    const thoughts: string[] = [];
-
-    // Unlocked abilities awareness
-    if (state?.heroCanDash) thoughts.push('Ability: Dash');
-    if (state?.heroCanShield) thoughts.push('Ability: Shield (absorbs 1 hit)');
-    if (state?.heroCanDoubleJump) thoughts.push('Ability: Double Jump');
-
-    // What zones does Glimmer think are safe/dangerous?
-    for (let i = 0; i < PLAYABLE_ZONES.length; i++) {
-      const zone = PLAYABLE_ZONES[i];
-      const belief = this.zoneBeliefs[ZONE_INDEX[zone as string]!];
-      if (belief && !belief.safe) {
-        thoughts.push(`${zone} is dangerous (last checked ${belief.lastChecked.toFixed(1)}s)`);
-      }
-    }
-
-    // Current strategy
-    thoughts.push(`Strategy: ${this.currentStrategy}`);
-    thoughts.push(`Curiosity: ${(this.curiosity * 100).toFixed(0)}%`);
-
-    // Most recent memory
-    const ent = Array.from(this.memory.entries());
-    const recent = ent
-      .filter((e) => e[1].length > 0)
-      .sort((a, b) => {
-        const aArr = a[1];
-        const bArr = b[1];
-        return bArr[bArr.length - 1].timestamp - aArr[aArr.length - 1].timestamp;
-      })
-      .slice(0, 3);
-
-    for (const [key, entries] of recent) {
-      const last = entries[entries.length - 1];
-      thoughts.push(`Remember: ${key} → ${last.outcome}`);
-    }
-
-    return thoughts;
-  }
-
-  /** Memory heatmap data for review */
-  getMemoryHeatmap(): Map<ZoneId, number> {
-    const heat = new Map<ZoneId, number>();
-    for (const z of PLAYABLE_ZONES) {
-      heat.set(z, 0);
-    }
-    for (const [, entries] of this.memory) {
-      for (const e of entries) {
-        const current = heat.get(e.zone) || 0;
-        heat.set(e.zone, current + (e.outcome === 'damage' ? 3 : e.outcome === 'dodge' ? 1 : 0));
-      }
-    }
-    // Normalize
-    const max = Math.max(...Array.from(heat.values()), 1);
-    for (const [z, v] of heat) {
-      heat.set(z, v / max);
-    }
-    return heat;
-  }
-
-  // ---- Private ----
-
-  private memoryKey(zone: ZoneId, ruleType: RuleType | null): string {
-    if (ruleType === null) return `${zone}:any`;
-    return `${zone}:${ruleType}`;
-  }
-
-
+  
+  // ═══════════════════════════════════════════════════════
+  // STRATEGY SELECTION
+  // ═══════════════════════════════════════════════════════
+  
+  /** Evaluate whether to switch strategy */
   private evaluateStrategy(state: ArenaState): void {
-    // Switch strategies periodically or when stuck
-    const switchTime = 3 + this.failureStreak * 2;
-    if (this.strategyTimer > switchTime) {
-      this.pickNewStrategy(state);
-      this.strategyTimer = 0;
-    }
+    // Switch strategies every 3-5 seconds
+    const switchTime = 3 + Math.random() * 2;
+    if (this.strategyTimer < switchTime) return;
+    
+    this.strategyTimer = 0;
+    this.pickNewStrategy(state);
   }
-
+  
+  /** Pick a new strategy based on memory and situation */
   private pickNewStrategy(state: ArenaState): void {
     const strategies = this.getAvailableStrategies(state);
-
-    // Weight by past success and randomness
+    
+    // Weight by past success
     const weights = strategies.map(s => {
-      const tries = this.strategyTries.get(s.name) || 0;
-      const baseWeight = s.priority;
-      // Boost strategies not tried much (exploration)
-      const noveltyBonus = Math.max(0, 10 - tries) * 0.5;
-      // If failureStreak is high, prefer safer strategies
-      const safetyBias = this.failureStreak > 5 ? (s.riskLevel === 'low' ? 5 : 0) : 0;
-      return baseWeight + noveltyBonus + safetyBias;
+      const success = this.strategySuccess.get(s) ?? 0;
+      const failure = this.strategyFailure.get(s) ?? 0;
+      const net = success - failure;
+      return Math.max(1, 5 + net);
     });
-
+    
+    // Weighted random selection
     const totalWeight = weights.reduce((a, b) => a + b, 0);
     let roll = Math.random() * totalWeight;
+    
     for (let i = 0; i < strategies.length; i++) {
       roll -= weights[i];
       if (roll <= 0) {
-        this.currentStrategy = strategies[i].name;
+        this.currentStrategy = strategies[i];
+        this.addJournalEntry(state, `Switching to ${strategies[i]} strategy`);
         return;
       }
     }
-    this.currentStrategy = strategies[0].name;
+    
+    this.currentStrategy = strategies[0];
   }
-
-  private getAvailableStrategies(state: ArenaState): { name: string; priority: number; riskLevel: 'low' | 'mid' | 'high' }[] {
-    return [
-      { name: 'rush',      priority: 5 + (this.curiosity > 0.4 ? 0 : 3), riskLevel: 'high' },
-      { name: 'explore',   priority: 8, riskLevel: 'mid' },
-      { name: 'sneak',     priority: 4 + this.failureStreak * 2, riskLevel: 'low' },
-      { name: 'observe',   priority: 3 + (this.curiosity > 0.3 ? 5 : 0), riskLevel: 'low' },
-      { name: 'pattern',   priority: this.memory.size > 5 ? 7 : 2, riskLevel: 'mid' },
-    ];
+  
+  /** Get available strategies based on abilities and situation */
+  private getAvailableStrategies(state: ArenaState): AIStrategy[] {
+    const strategies: AIStrategy[] = [AIStrategy.Wait, AIStrategy.Bait];
+    
+    // Rush is always available but risky
+    strategies.push(AIStrategy.Rush);
+    
+    // Feint requires some memory
+    if (this.memory.size > 3) {
+      strategies.push(AIStrategy.Feint);
+    }
+    
+    // Dash requires Dash ability
+    if (state.hero.abilities.has(HeroAbility.Dash)) {
+      strategies.push(AIStrategy.Dash);
+    }
+    
+    return strategies;
   }
-
+  
+  // ═══════════════════════════════════════════════════════
+  // STRATEGY EXECUTION
+  // ═══════════════════════════════════════════════════════
+  
+  /** Execute the current strategy */
   private executeStrategy(state: ArenaState): HeroAction {
-    // Glimmer's reaction delay — never frame-perfect
-    const reactTicks = Math.floor(GAME_CONFIG.GLIMMER_REACTION_MS / 100);
-
     switch (this.currentStrategy) {
-      case 'rush':
+      case AIStrategy.Rush:
         return this.rushStrategy(state);
-      case 'explore':
-        return this.exploreStrategy(state);
-      case 'sneak':
-        return this.sneakStrategy(state);
-      case 'observe':
-        return this.observeStrategy(state);
-      case 'pattern':
-        return this.patternStrategy(state);
+      case AIStrategy.Bait:
+        return this.baitStrategy(state);
+      case AIStrategy.Wait:
+        return this.waitStrategy(state);
+      case AIStrategy.Feint:
+        return this.feintStrategy(state);
+      case AIStrategy.Dash:
+        return this.dashStrategy(state);
       default:
-        return this.exploreStrategy(state);
+        return this.waitStrategy(state);
     }
   }
-
-  /** Rush toward the boss, ignoring danger */
+  
+  /** Rush: Sprint through, ignore trap */
   private rushStrategy(state: ArenaState): HeroAction {
-    const currentIdx = ZONE_INDEX[state.heroZone as string];
-    const bossIdx = ZONE_INDEX[ZoneId.CenterPlatform as string];
-
-    // If hero has dash and next zone has flame vent, dash through it
-    if (state.heroCanDash && state.heroDashCooldown <= 0) {
-      const nextIdx = currentIdx + (currentIdx < bossIdx ? 1 : -1);
-      if (nextIdx >= 0 && nextIdx < PLAYABLE_ZONES.length) {
-        const nextZone = PLAYABLE_ZONES[nextIdx];
-        if (!state.isZoneSafe(nextZone)) {
-          return HeroAction.Dash;
-        }
-      }
+    // Move toward Zone5 (right)
+    if (state.hero.zone === ZoneId.Zone5) {
+      return HeroAction.Wait; // Already at end
     }
-    // If hero has double-jump and is at boss zone, celebrate
-    if (state.heroCanDoubleJump && state.heroDoubleJumpReady && currentIdx === bossIdx) {
-      return HeroAction.Jump;
-    }
-
-    if (currentIdx < bossIdx) return HeroAction.MoveRight;
-    if (currentIdx > bossIdx) return HeroAction.MoveLeft;
-    return HeroAction.Jump;
+    
+    // Move right
+    return HeroAction.MoveRight;
   }
-
-  /** Explore the arena, visiting new zones and testing rules */
-  private exploreStrategy(state: ArenaState): HeroAction {
-    // Find the most unchecked zone (avoids filter allocations)
-    let bestTarget: ZoneId | null = null;
-    let bestTime = -Infinity;
-    for (let i = 0; i < PLAYABLE_ZONES.length; i++) {
-      const z = PLAYABLE_ZONES[i];
-      if (z === state.heroZone) continue;
-      const belief = this.zoneBeliefs[ZONE_INDEX[z as string]!];
-      const lastChecked = belief ? belief.lastChecked : 0;
-      if (!belief || lastChecked < state.elapsedTime - 5) {
-        if (lastChecked > bestTime) {
-          bestTarget = z;
-          bestTime = lastChecked;
-        }
-      }
+  
+  /** Bait: Fake approach, retreat, approach again */
+  private baitStrategy(state: ArenaState): HeroAction {
+    const heroZone = state.hero.zone;
+    const trapZone = state.trap?.zone;
+    
+    // If no trap, just rush
+    if (!trapZone) {
+      return this.rushStrategy(state);
     }
-    if (bestTarget) return this.moveToward(state.heroZone, bestTarget);
+    
+    const heroIdx = ZONE_INDEX[heroZone] ?? 0;
+    const trapIdx = ZONE_INDEX[trapZone] ?? 0;
+    
+    // If hero is before trap, bait the player
+    if (heroIdx < trapIdx) {
+      // Get distance to trap
+      const distanceToTrap = trapIdx - heroIdx;
+      
+      // If close to trap, be more likely to feint
+      if (distanceToTrap <= 2) {
+        // 40% chance to retreat (bait activation)
+        if (Math.random() < 0.4 && heroIdx > 0) {
+          this.isFaking = true;
+          return HeroAction.MoveLeft;
+        }
+        // 60% chance to advance
+        this.isFaking = false;
+        return HeroAction.MoveRight;
+      }
+      
+      // If far from trap, alternate approach/retreat
+      if (this.isFaking) {
+        // Retreating
+        if (heroIdx > 0) {
+          return HeroAction.MoveLeft;
+        }
+      } else {
+        // Approaching
+        return HeroAction.MoveRight;
+      }
+      
+      // Toggle fake state
+      this.isFaking = !this.isFaking;
+    }
+    
+    // If hero is at or past trap, rush through
     return this.rushStrategy(state);
   }
-
-  /** Move carefully, preferring safe zones and timing hazards */
-  private sneakStrategy(state: ArenaState): HeroAction {
-    // If current zone is dangerous, leave immediately (or use shield)
-    if (!state.isZoneSafe(state.heroZone)) {
-      if (state.heroCanShield && state.heroShieldHP > 0) {
-        // Shield will absorb damage, keep moving toward boss
-      } else {
-        const neighbors = state.getNeighbors(state.heroZone);
-        const safeNeighbor = neighbors.find(n => state.isZoneSafe(n) && this.zoneBeliefs[ZONE_INDEX[n as string]!]?.safe !== false);
-        if (safeNeighbor) return this.moveToward(state.heroZone, safeNeighbor);
-      }
-    }
-
-    // Otherwise, carefully advance toward boss
-    const currentIdx = ZONE_INDEX[state.heroZone as string];
-    const bossIdx = ZONE_INDEX[ZoneId.CenterPlatform as string];
-    const direction = currentIdx < bossIdx ? HeroAction.MoveRight : HeroAction.MoveLeft;
-
-    // But wait sometimes to observe timing
-    if (Math.random() < 0.3) return HeroAction.Wait;
-
-    // If next zone is dangerous, wait
-    const nextIdx = currentIdx + (currentIdx < bossIdx ? 1 : -1);
-    if (nextIdx >= 0 && nextIdx < PLAYABLE_ZONES.length) {
-      const nextZone = PLAYABLE_ZONES[nextIdx];
-      if (!state.isZoneSafe(nextZone)) {
-        if (!state.heroCanShield || state.heroShieldHP <= 0) {
-          return HeroAction.Wait;
-        }
-      }
-    }
-
-    return direction;
-  }
-
-  /** Stand still and observe — learn timing patterns */
-  private observeStrategy(_state: ArenaState): HeroAction {
-    // Just wait and watch — builds memory through observation
-    // Every few ticks, move slightly to test a different spot
+  
+  /** Wait: Stand still, observe trap timing */
+  private waitStrategy(state: ArenaState): HeroAction {
+    // Just wait and observe
+    // Every few seconds, make a small movement to test
     if (Math.random() < 0.15) {
       return Math.random() < 0.5 ? HeroAction.MoveLeft : HeroAction.MoveRight;
     }
     return HeroAction.Wait;
   }
-
-  /** Use memory of past patterns to anticipate hazards */
-  private patternStrategy(state: ArenaState): HeroAction {
-    // Check if we have memory for current zone
-    const key = this.memoryKey(state.heroZone, null);
-    const entries = this.memory.get(key);
-
-    if (entries && entries.length > 0) {
-      // If we've been damaged here before, try to leave or dodge
-      const lastDamage = entries.filter(e => e.outcome === 'damage').length;
-      if (lastDamage > 1) {
-        // This zone is dangerous — leave
-        const neighbors = state.getNeighbors(state.heroZone);
-        if (neighbors.length > 0) {
-          const target = neighbors[Math.floor(Math.random() * neighbors.length)];
-          return this.moveToward(state.heroZone, target);
+  
+  /** Feint: Quick movement one way, reverse */
+  private feintStrategy(state: ArenaState): HeroAction {
+    const heroZone = state.hero.zone;
+    const trapZone = state.trap?.zone;
+    
+    // If no trap, just rush
+    if (!trapZone) {
+      return this.rushStrategy(state);
+    }
+    
+    const heroIdx = ZONE_INDEX[heroZone] ?? 0;
+    const trapIdx = ZONE_INDEX[trapZone] ?? 0;
+    
+    // If hero is before trap, feint to bait activation
+    if (heroIdx < trapIdx) {
+      const distanceToTrap = trapIdx - heroIdx;
+      
+      // If close to trap, be more aggressive with feints
+      if (distanceToTrap <= 2) {
+        // 60% chance to feint (move away then come back)
+        if (Math.random() < 0.6) {
+          // Feint: move toward trap, then retreat
+          if (heroIdx > 0) {
+            return HeroAction.MoveLeft;
+          }
         }
+        // 40% chance to rush through
+        return HeroAction.MoveRight;
+      }
+      
+      // If far from trap, random feint
+      if (Math.random() < 0.5) {
+        return HeroAction.MoveLeft;
+      } else {
+        return HeroAction.MoveRight;
       }
     }
-
-    // Check if any zone has no damage memory — go there
-    const safeZone = PLAYABLE_ZONES.find(z => {
-      const k = this.memoryKey(z, null);
-      const mem = this.memory.get(k);
-      return !mem || mem.every(e => e.outcome !== 'damage');
-    });
-
-    if (safeZone && safeZone !== state.heroZone) {
-      return this.moveToward(state.heroZone, safeZone);
-    }
-
-    // Everything has hurt us — rush boss as last resort
+    
+    // If hero is at or past trap, rush through
     return this.rushStrategy(state);
   }
-
-  /** Move from one zone toward another zone */
-  private moveToward(from: ZoneId, to: ZoneId): HeroAction {
-    const fromIdx = ZONE_INDEX[from as string];
-    const toIdx = ZONE_INDEX[to as string];
-    if (fromIdx < toIdx) return HeroAction.MoveRight;
-    if (fromIdx > toIdx) return HeroAction.MoveLeft;
-
-    // Same zone — need to go through walkways
-    const neighbors = ZONE_CONNECTIONS[from];
-    if (neighbors.length > 0) {
-      const target = neighbors.reduce((best, n) => {
-        const bestIdx = best ? Math.abs(ZONE_INDEX[best as string] - toIdx) : Infinity;
-        const nIdx = Math.abs(ZONE_INDEX[n as string] - toIdx);
-        return nIdx < bestIdx ? n : best;
-      });
-      if (target) {
-        return this.moveToward(from, target);
+  
+  /** Dash: Quick movement through trap zone */
+  private dashStrategy(state: ArenaState): HeroAction {
+    // If hero has dash and trap is active, dash through
+    if (state.hero.abilities.has(HeroAbility.Dash) && state.hero.dashCooldown <= 0) {
+      if (state.trap && state.hero.zone === state.trap.zone && state.trap.fired) {
+        return HeroAction.Dash;
       }
     }
-
-    // Can't determine path — jump (trying to find a way)
-    return HeroAction.Jump;
+    
+    // Otherwise, rush
+    return this.rushStrategy(state);
   }
-
-  /** Consolidate memory after each attempt — prune noise */
+  
+  /** Move from one zone toward another */
+  private moveToward(from: ZoneId, to: ZoneId): HeroAction {
+    const fromIdx = ZONE_INDEX[from] ?? 0;
+    const toIdx = ZONE_INDEX[to] ?? 0;
+    
+    if (fromIdx < toIdx) return HeroAction.MoveRight;
+    if (fromIdx > toIdx) return HeroAction.MoveLeft;
+    return HeroAction.Wait;
+  }
+  
+  // ═══════════════════════════════════════════════════════
+  // INTENT COMPUTATION
+  // ═══════════════════════════════════════════════════════
+  
+  /** Compute hero's next intended zone (for visible intent display) */
+  private computeIntent(state: ArenaState): void {
+    // Simulate one step ahead
+    const action = this.lastAction;
+    const currentZone = state.hero.zone;
+    const neighbors = state.getNeighbors(currentZone);
+    
+    if (action === HeroAction.MoveRight) {
+      const nextIdx = (ZONE_INDEX[currentZone] ?? 0) + 1;
+      if (nextIdx < ALL_ZONES.length) {
+        this.intentZone = ALL_ZONES[nextIdx];
+      }
+    } else if (action === HeroAction.MoveLeft) {
+      const nextIdx = (ZONE_INDEX[currentZone] ?? 0) - 1;
+      if (nextIdx >= 0) {
+        this.intentZone = ALL_ZONES[nextIdx];
+      }
+    } else if (action === HeroAction.Jump) {
+      // Jump goes to boss zone if available
+      if (currentZone === ZoneId.Zone2 || currentZone === ZoneId.Zone4) {
+        this.intentZone = ZoneId.Zone3;
+      }
+    } else {
+      this.intentZone = currentZone;
+    }
+    
+    state.heroIntent = this.intentZone;
+  }
+  
+  // ═══════════════════════════════════════════════════════
+  // OUTCOME RECORDING
+  // ═══════════════════════════════════════════════════════
+  
+  /** Record what happened to the hero this frame */
+  recordOutcome(state: ArenaState, damaged: boolean, dodged: boolean): void {
+    const zone = state.hero.zone;
+    const trapType = state.trap?.type ?? null;
+    
+    const key = this.memoryKey(zone, trapType);
+    const outcome: MemoryEntry = {
+      zone,
+      trapType,
+      outcome: damaged ? 'hit' : dodged ? 'dodged' : 'safe',
+      timestamp: state.elapsedTime,
+      attempt: state.attemptNumber,
+      strategy: this.currentStrategy,
+    };
+    
+    let arr = this.memory.get(key);
+    if (!arr) { arr = []; this.memory.set(key, arr); }
+    arr.push(outcome);
+    
+    // Update timing memory
+    if (damaged) {
+      const timeSlot = Math.floor(state.elapsedTime);
+      this.timingMemory.set(timeSlot, (this.timingMemory.get(timeSlot) ?? 0) + 1);
+    }
+    
+    // Update strategy success/failure
+    if (damaged) {
+      this.strategyFailure.set(this.currentStrategy, (this.strategyFailure.get(this.currentStrategy) ?? 0) + 1);
+      this.addJournalEntry(state, `Ouch! Took damage in ${zone} with ${this.currentStrategy} strategy`);
+    } else if (dodged) {
+      this.strategySuccess.set(this.currentStrategy, (this.strategySuccess.get(this.currentStrategy) ?? 0) + 1);
+      this.addJournalEntry(state, `Dodged! ${this.currentStrategy} strategy worked`);
+    }
+  }
+  
+  /** Record final outcome of an attempt */
+  recordAttemptOutcome(state: ArenaState): void {
+    if (state.hero.won) {
+      // Hero survived — strategy worked
+      this.strategySuccess.set(this.currentStrategy, (this.strategySuccess.get(this.currentStrategy) ?? 0) + 10);
+      this.addJournalEntry(state, `I survived! ${this.currentStrategy} strategy was effective`);
+    } else if (!state.hero.alive) {
+      // Hero died — strategy failed
+      this.strategyFailure.set(this.currentStrategy, (this.strategyFailure.get(this.currentStrategy) ?? 0) + 5);
+      this.addJournalEntry(state, `Defeated... ${this.currentStrategy} strategy didn't work`);
+    }
+    
+    // Consolidate memory
+    this.consolidateMemory();
+  }
+  
+  /** Consolidate memory after each attempt — prune old entries */
   private consolidateMemory(): void {
-    // Keep only the most relevant memories
     for (const [key, entries] of this.memory) {
-      // Keep the last 20 entries per key
+      // Keep only the last 20 entries per key
       if (entries.length > 20) {
         this.memory.set(key, entries.slice(-20));
       }
+    }
+    
+    // Keep only last 50 timing entries
+    if (this.timingMemory.size > 50) {
+      const entries = Array.from(this.timingMemory.entries());
+      this.timingMemory = new Map(entries.slice(-50));
+    }
+  }
+  
+  // ═══════════════════════════════════════════════════════
+  // NEW ATTEMPT
+  // ═══════════════════════════════════════════════════════
+  
+  /** Reset for a new attempt (keep memory!) */
+  onNewAttempt(state?: ArenaState): void {
+    this.strategyTimer = 0;
+    this.reactionAccum = 0;
+    this.isFaking = false;
+    this.fakeTarget = null;
+    this.realTarget = null;
+    this.intentZone = null;
+    this.attemptNumber++;
+    
+    // Pick new strategy if state provided
+    if (state) {
+      this.pickNewStrategy(state);
+    } else {
+      // Default to Wait strategy
+      this.currentStrategy = AIStrategy.Wait;
+    }
+  }
+  
+  /** Increase curiosity after new trap is encountered */
+  onNewTrap(state: ArenaState): void {
+    // Reset beliefs for trap zone
+    if (state.trap) {
+      const idx = ZONE_INDEX[state.trap.zone] ?? 0;
+      this.zoneBeliefs[idx] = { safe: true, dangerLevel: 0, lastChecked: 0 };
+    }
+    
+    // Switch to Wait strategy to observe
+    this.currentStrategy = AIStrategy.Wait;
+    this.addJournalEntry(state, `New trap detected! Switching to observe strategy`);
+  }
+  
+  // ═══════════════════════════════════════════════════════
+  // GETTERS
+  // ═══════════════════════════════════════════════════════
+  
+  /** Get the hero's "thought process" for review panel */
+  getThoughts(state?: ArenaState): string[] {
+    const thoughts: string[] = [];
+    
+    // Current strategy
+    thoughts.push(`Strategy: ${this.currentStrategy}`);
+    
+    // Zone beliefs
+    for (let i = 0; i < ALL_ZONES.length; i++) {
+      const zone = ALL_ZONES[i];
+      const belief = this.zoneBeliefs[i];
+      if (belief && !belief.safe) {
+        thoughts.push(`${zone} is dangerous (danger: ${(belief.dangerLevel * 100).toFixed(0)}%)`);
+      }
+    }
+    
+    // Unlocked abilities
+    if (state?.hero.abilities.has(HeroAbility.Dash)) thoughts.push('Ability: Dash');
+    if (state?.hero.abilities.has(HeroAbility.Shield)) thoughts.push('Ability: Shield');
+    if (state?.hero.abilities.has(HeroAbility.DoubleJump)) thoughts.push('Ability: Double Jump');
+    
+    // Memory stats
+    thoughts.push(`Memory entries: ${this.memory.size}`);
+    thoughts.push(`Timing patterns: ${this.timingMemory.size}`);
+    
+    return thoughts;
+  }
+  
+  /** Get a concise real-time thought for the in-game thought bubble */
+  getLiveThought(state: ArenaState): string {
+    const zone = state.hero.zone;
+    const trapZone = state.trap?.zone;
+    const trapType = state.trap?.type;
+    
+    // Strategy-specific flavor text
+    let strategyText: string;
+    switch (this.currentStrategy) {
+      case AIStrategy.Rush: strategyText = '⚔️ charging!'; break;
+      case AIStrategy.Bait: strategyText = '🎭 baiting...'; break;
+      case AIStrategy.Wait: strategyText = '👁 watching...'; break;
+      case AIStrategy.Feint: strategyText = '🔄 feinting'; break;
+      case AIStrategy.Dash: strategyText = '⚡ dashing!'; break;
+      default: strategyText = '🧠 thinking'; break;
+    }
+    
+    // If in trap zone, show danger
+    if (trapZone && zone === trapZone && state.trap?.fired) {
+      const trapName = trapType ? trapType.charAt(0).toUpperCase() + trapType.slice(1) : 'Trap';
+      return `${strategyText} ⚠️ ${trapName}!`;
+    }
+    
+    // If approaching trap, show awareness
+    if (trapZone) {
+      const zoneIdx = ZONE_INDEX[zone] ?? 0;
+      const trapIdx = ZONE_INDEX[trapZone] ?? 0;
+      if (zoneIdx < trapIdx) {
+        return `${strategyText} 😰 trap ahead`;
+      }
+    }
+    
+    // Show strategy
+    return strategyText;
+  }
+  
+  /** Get memory heatmap data for review */
+  getMemoryHeatmap(): Map<ZoneId, number> {
+    const heat = new Map<ZoneId, number>();
+    
+    for (const zone of ALL_ZONES) {
+      heat.set(zone, 0);
+    }
+    
+    for (const [, entries] of this.memory) {
+      for (const e of entries) {
+        const current = heat.get(e.zone) ?? 0;
+        heat.set(e.zone, current + (e.outcome === 'hit' ? 3 : e.outcome === 'dodged' ? 1 : 0));
+      }
+    }
+    
+    // Normalize
+    const max = Math.max(...Array.from(heat.values()), 1);
+    for (const [z, v] of heat) {
+      heat.set(z, v / max);
+    }
+    
+    return heat;
+  }
+  
+  /** Get the AI journal for display */
+  getJournal(): AIJournalEntry[] {
+    return [...this.aiJournal];
+  }
+  
+  // ═══════════════════════════════════════════════════════
+  // PRIVATE HELPERS
+  // ═══════════════════════════════════════════════════════
+  
+  private memoryKey(zone: ZoneId, trapType: TrapType | null): string {
+    return trapType ? `${zone}:${trapType}` : `${zone}:any`;
+  }
+  
+  private addJournalEntry(state: ArenaState, thought: string): void {
+    this.aiJournal.push({
+      thought,
+      timestamp: state.elapsedTime,
+      attempt: state.attemptNumber,
+      zone: state.hero.zone,
+    });
+    
+    // Keep only last 20 entries
+    if (this.aiJournal.length > 20) {
+      this.aiJournal = this.aiJournal.slice(-20);
     }
   }
 }

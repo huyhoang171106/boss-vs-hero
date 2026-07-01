@@ -52,6 +52,20 @@ Place two rules in the same zone to create **synergies**:
 
 - **Flame Vent + Spike Wall** → **Molten Spikes**: Double damage when both trigger. The deadliest combo.
 
+
+### Environmental Events
+
+Every 7-11 seconds during an attempt, a **random environmental event** triggers, forcing you to adapt your strategy in real-time:
+
+| Event | Effect | Duration |
+|-------|--------|----------|
+| **⚡ Speed Surge** | Glimmer moves 2x faster — traps fire more frequently | 4s |
+| **💥 Amplify** | All traps deal 2x damage — devastating combos | 4s |
+| **🛡️ Shield Pulse** | Glimmer gains a temporary shield — must break it first | 4s |
+| **⭐ Bonus Zone** | One zone glows gold — traps there deal 3x damage | 4s |
+| **🐌 Slow Field** | Glimmer moves 50% slower — traps have more time to trigger | 4s |
+
+Events create **dynamic tension** — the arena changes mid-attempt, and you must use your abilities strategically to capitalize (or survive).
 ### Glimmer's Abilities (Unlocked Through Deaths)
 
 Glimmer isn't helpless. As it dies, it **evolves**:
@@ -87,6 +101,12 @@ Glimmer doesn't follow a script. It uses a **Strategy Tree** — a memory-based 
 5. **Failure Streaks**: Repeated deaths make Glimmer more cautious — it switches to safer strategies.
 
 The AI has a **reaction delay** (300ms) so it's not frame-perfect — it makes human-like mistakes.
+
+### Visible AI Intent
+
+Glimmer's **next move is always shown** — a glowing arrow on the target zone indicates where it plans to go. This creates the **Into the Breach** dynamic: you can see what the AI intends and decide whether to let it happen or counter with an ability.
+
+The hero's current **strategy** is also displayed (⚔️ Aggressive, 🛡️ Cautious, 🧠 Adaptive, 💀 Desperate), so you can predict its behavior patterns.
 
 ### After Each Attempt
 

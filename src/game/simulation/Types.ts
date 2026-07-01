@@ -1,86 +1,124 @@
-/** Core types for Loophole simulation */
+/**
+ * DEADLOCK — Core Types
+ * 
+ * One trap. Manual activation. AI mind games.
+ */
 
-export interface Vec2 {
-  x: number;
-  y: number;
-}
+// ═══════════════════════════════════════════════════════
+// ARENA ZONES
+// ═══════════════════════════════════════════════════════
 
-/** Arena zones the hero can occupy */
+/** Arena zones — hero crosses from left to right */
 export enum ZoneId {
-  LeftPlatform = 'left',
-  LeftWalkway = 'leftWalk',
-  CenterPlatform = 'center',
-  RightWalkway = 'rightWalk',
-  RightPlatform = 'right',
-  Pit = 'pit',
+  Zone1 = 'zone1',  // Hero start
+  Zone2 = 'zone2',
+  Zone3 = 'zone3',  // Boss zone (center)
+  Zone4 = 'zone4',
+  Zone5 = 'zone5',  // Hero goal (right)
 }
 
-/** Zones that are actually reachable */
-export const PLAYABLE_ZONES: ZoneId[] = [
-  ZoneId.LeftPlatform,
-  ZoneId.LeftWalkway,
-  ZoneId.CenterPlatform,
-  ZoneId.RightWalkway,
-  ZoneId.RightPlatform,
+/** All zones in order */
+export const ALL_ZONES: ZoneId[] = [
+  ZoneId.Zone1,
+  ZoneId.Zone2,
+  ZoneId.Zone3,
+  ZoneId.Zone4,
+  ZoneId.Zone5,
 ];
 
-/** Pre-computed zone-to-index mapping (avoids indexOf in hot paths) */
+/** Zones where traps can be placed (not Zone1 - hero start) */
+export const TRAP_ZONES: ZoneId[] = [
+  ZoneId.Zone2,
+  ZoneId.Zone3,
+  ZoneId.Zone4,
+  ZoneId.Zone5,
+];
+
+/** Pre-computed zone-to-index mapping */
 export const ZONE_INDEX: Record<string, number> = {
-  [ZoneId.LeftPlatform]: 0,
-  [ZoneId.LeftWalkway]: 1,
-  [ZoneId.CenterPlatform]: 2,
-  [ZoneId.RightWalkway]: 3,
-  [ZoneId.RightPlatform]: 4,
+  [ZoneId.Zone1]: 0,
+  [ZoneId.Zone2]: 1,
+  [ZoneId.Zone3]: 2,
+  [ZoneId.Zone4]: 3,
+  [ZoneId.Zone5]: 4,
 };
 
-
-/** Named platform zones (where rules can be placed) */
-export const PLATFORM_ZONES: ZoneId[] = [
-  ZoneId.LeftPlatform,
-  ZoneId.CenterPlatform,
-  ZoneId.RightPlatform,
-];
-
-/** Rule types available in prototype */
-export enum RuleType {
-  FlameVent = 'flameVent',
-  SpikeWall = 'spikeWall',
-  SentryOrb = 'sentryOrb',
-  GravityWell = 'gravityWell',
-  TemporalRift = 'temporalRift',
-}
-
-/** Pre-computed rule-type-to-index mapping */
-export const RULE_TYPE_INDEX: Record<string, number> = {
-  [RuleType.FlameVent]: 0,
-  [RuleType.SpikeWall]: 1,
-  [RuleType.SentryOrb]: 2,
-  [RuleType.GravityWell]: 3,
-  [RuleType.TemporalRift]: 4,
+/** Zone connections (linear) */
+export const ZONE_CONNECTIONS: Record<ZoneId, ZoneId[]> = {
+  [ZoneId.Zone1]: [ZoneId.Zone2],
+  [ZoneId.Zone2]: [ZoneId.Zone1, ZoneId.Zone3],
+  [ZoneId.Zone3]: [ZoneId.Zone2, ZoneId.Zone4],
+  [ZoneId.Zone4]: [ZoneId.Zone3, ZoneId.Zone5],
+  [ZoneId.Zone5]: [ZoneId.Zone4],
 };
 
-export interface RuleCard {
-  id: string;
-  type: RuleType;
-  zone: ZoneId;
-  /** Primary parameter: cooldown/interval in seconds */
-  param: number;
-  /** Is this rule currently active? */
-  active: boolean;
+/** Visual positions of each zone (fraction of game width/height) */
+export const ZONE_POSITIONS: Record<ZoneId, { x: number; y: number }> = {
+  [ZoneId.Zone1]: { x: 0.15, y: 0.5 },
+  [ZoneId.Zone2]: { x: 0.325, y: 0.5 },
+  [ZoneId.Zone3]: { x: 0.5, y: 0.5 },
+  [ZoneId.Zone4]: { x: 0.675, y: 0.5 },
+  [ZoneId.Zone5]: { x: 0.85, y: 0.5 },
+};
+
+// ═══════════════════════════════════════════════════════
+// TRAP TYPES
+// ═══════════════════════════════════════════════════════
+
+/** Trap types — each has unique properties */
+export enum TrapType {
+  Fire = 'fire',
+  Ice = 'ice',
+  Spike = 'spike',
+  Void = 'void',
 }
 
-export interface RuleState {
-  /** Rule definition */
-  card: RuleCard;
-  /** Time elapsed since last trigger (for TimerHazard types) */
-  timer: number;
-  /** Whether the rule is currently in its "active" visual state */
-  isErupting: boolean;
-  /** Extra state for SpikeWall: the wall is up? */
-  wallUp: boolean;
-  /** Extra state for SentryOrb: projectile position (null = inactive) */
-  projectile: { x: number; y: number; vx: number; vy: number } | null;
-}
+/** Trap type configurations */
+export const TRAP_CONFIG: Record<TrapType, {
+  damage: number;
+  cooldown: number;
+  duration: number;
+  description: string;
+  color: string;
+  heroCounter: string;
+}> = {
+  [TrapType.Fire]: {
+    damage: 2,
+    cooldown: 2,
+    duration: 2,
+    description: 'High damage, instant activation',
+    color: '#ff4444',
+    heroCounter: 'Dash through during cooldown',
+  },
+  [TrapType.Ice]: {
+    damage: 1,
+    cooldown: 2,
+    duration: 4,
+    description: 'Slows hero for 2 seconds',
+    color: '#44aaff',
+    heroCounter: 'Jump over before activation',
+  },
+  [TrapType.Spike]: {
+    damage: 2,
+    cooldown: 2,
+    duration: 1,
+    description: 'Delayed activation (0.5s)',
+    color: '#ffaa00',
+    heroCounter: 'Move during delay window',
+  },
+  [TrapType.Void]: {
+    damage: 0,
+    cooldown: 2,
+    duration: 3,
+    description: 'Teleports hero to random zone',
+    color: '#aa44ff',
+    heroCounter: 'Avoid the zone entirely',
+  },
+};
+
+// ═══════════════════════════════════════════════════════
+// HERO ACTIONS
+// ═══════════════════════════════════════════════════════
 
 /** Hero actions */
 export enum HeroAction {
@@ -91,61 +129,127 @@ export enum HeroAction {
   Dash = 'dash',
 }
 
-/** Zones have connectivity for pathfinding */
-export const ZONE_CONNECTIONS: Record<ZoneId, ZoneId[]> = {
-  [ZoneId.LeftPlatform]:   [ZoneId.LeftWalkway],
-  [ZoneId.LeftWalkway]:    [ZoneId.LeftPlatform, ZoneId.CenterPlatform],
-  [ZoneId.CenterPlatform]: [ZoneId.LeftWalkway, ZoneId.RightWalkway],
-  [ZoneId.RightWalkway]:   [ZoneId.CenterPlatform, ZoneId.RightPlatform],
-  [ZoneId.RightPlatform]:  [ZoneId.RightWalkway],
-  [ZoneId.Pit]:            [],
-};
-
-/** Visual positions of each zone on screen (fraction of game width/height) */
-export const ZONE_POSITIONS: Record<ZoneId, { x: number; y: number }> = {
-  [ZoneId.LeftPlatform]:   { x: 0.35, y: 0.6 },
-  [ZoneId.LeftWalkway]:    { x: 0.45, y: 0.75 },
-  [ZoneId.CenterPlatform]: { x: 0.55, y: 0.45 },
-  [ZoneId.RightWalkway]:   { x: 0.72, y: 0.75 },
-  [ZoneId.RightPlatform]:  { x: 0.85, y: 0.6 },
-  [ZoneId.Pit]:            { x: 0.55, y: 0.9 },
-};
-
-/** Simulation state snapshot (serializable) */
-export interface SimulationSnapshot {
-  hero: {
-    zone: ZoneId;
-    hp: number;
-    action: HeroAction;
-    alive: boolean;
-    elapsedTime: number;
-  };
-  rules: RuleState[];
-  boss: {
-    alive: boolean;
-    phase: number;
-  };
-  attemptNumber: number;
-  heroWon: boolean;
+/** Hero abilities (unlocked through deaths) */
+export enum HeroAbility {
+  Dash = 'dash',
+  Shield = 'shield',
+  DoubleJump = 'doubleJump',
 }
 
-/** A memory entry in Glimmer's strategy tree */
+// ═══════════════════════════════════════════════════════
+// AI STRATEGIES
+// ═══════════════════════════════════════════════════════
+
+/** AI strategies for approaching traps */
+export enum AIStrategy {
+  Rush = 'rush',       // Sprint through, ignore trap
+  Bait = 'bait',       // Fake approach, retreat
+  Wait = 'wait',       // Stand still, observe
+  Feint = 'feint',     // Quick movement one way, reverse
+  Dash = 'dash',       // Quick movement through trap zone
+}
+
+// ═══════════════════════════════════════════════════════
+// GAME STATE
+// ═══════════════════════════════════════════════════════
+
+/** Trap state */
+export interface TrapState {
+  type: TrapType;
+  zone: ZoneId;
+  active: boolean;
+  cooldownTimer: number;
+  activeTimer: number;
+  /** Whether trap is currently "fired" (visual effect active) */
+  fired: boolean;
+}
+
+/** Hero state */
+export interface HeroState {
+  zone: ZoneId;
+  hp: number;
+  maxHp: number;
+  alive: boolean;
+  won: boolean;
+  /** Abilities unlocked */
+  abilities: Set<HeroAbility>;
+  /** Cooldowns */
+  dashCooldown: number;
+  shieldHp: number;
+  doubleJumpReady: boolean;
+}
+
+/** Memory entry for AI learning */
 export interface MemoryEntry {
   zone: ZoneId;
-  ruleType: RuleType | null;
-  outcome: 'damage' | 'safe' | 'dodge';
+  trapType: TrapType | null;
+  outcome: 'hit' | 'miss' | 'safe' | 'dodged';
   timestamp: number;
   attempt: number;
+  /** What strategy was used */
+  strategy: AIStrategy;
 }
 
-/** Configuration for the entire simulation */
+/** AI journal entry for display */
+export interface AIJournalEntry {
+  thought: string;
+  timestamp: number;
+  attempt: number;
+  zone: ZoneId;
+}
+
+// ═══════════════════════════════════════════════════════
+// GAME CONFIGURATION
+// ═══════════════════════════════════════════════════════
+
 export const GAME_CONFIG = {
+  // Hero
   HERO_MAX_HP: 3,
   HERO_DASH_COOLDOWN: 3,
-  GLIMMER_REACTION_MS: 300,
-  ATTEMPT_DURATION: 20,
-  RULE_DEPLOY_TIME: 3,
-  FLAME_DURATION: 1.5,
-  SPIKE_DURATION: 2,
-  ORB_SPEED: 120,
+  HERO_DASH_DURATION: 0.3,
+  HERO_SHIELD_HP: 1,
+  
+  // Trap
+  TRAP_ACTIVATION_DELAY: 0.5,  // Spike delay
+  TRAP_COOLDOWN: 2,
+  
+  // AI
+  AI_REACTION_MS: 300,
+  AI_FAKE_CHANCE: 0.3,
+  AI_LEARNING_RATE: 0.1,
+  
+  // Game
+  ATTEMPT_DURATION: 30,
+  STARTING_KILLS: 0,
+  
+  // Scoring
+  BASE_SCORE: 100,
+  EFFICIENCY_BONUS: 0.5,  // Per fewer activation
+  SPEED_BONUS: 0.1,       // Per second faster
+  
+  // Progression
+  UNLOCK_DASH_AT: 2,
+  UNLOCK_SHIELD_AT: 5,
+  UNLOCK_DOUBLE_JUMP_AT: 9,
+  UNLOCK_SECOND_TRAP_AT: 12,
+  UNLOCK_ARENA_MOD_AT: 15,
+  UNLOCK_THIRD_TRAP_AT: 20,
+  AI_HP_PER_5_KILLS: 1,
+  AI_REACTION_REDUCTION: 25,
+  AI_REACTION_REDUCTION_EVERY: 3,
 };
+
+// ═══════════════════════════════════════════════════════
+// SCORE
+// ═══════════════════════════════════════════════════════
+
+/** Score breakdown */
+export interface ScoreBreakdown {
+  base: number;
+  efficiency: number;
+  speed: number;
+  streak: number;
+  total: number;
+  activationsUsed: number;
+  timeToKill: number;
+}
